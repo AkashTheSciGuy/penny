@@ -47,3 +47,22 @@ test("100 years of daily transactions aggregate without losing precision", () =>
   }));
   assert.equal(totals(rows).income, 1058500);
 });
+
+test("month selection excludes other months, sorts latest first, and does not mutate data", async () => {
+  const { transactionsForMonth } = await import("../lib/finance.ts");
+  const rows = [...demoRows("2026-09"), ...demoRows("2026-08")];
+  const original = [...rows];
+  const september = transactionsForMonth(rows, "2026-09");
+  assert.equal(september.length, 12);
+  assert.equal(september[0].title, "Bookshop");
+  assert.ok(september.every((row) => row.date.startsWith("2026-09-")));
+  assert.deepEqual(rows, original);
+  assert.equal(transactionsForMonth(rows, "2026-07").length, 0);
+});
+
+test("new entries default to selected month while current month uses today", async () => {
+  const { entryDate } = await import("../lib/finance.ts");
+  assert.equal(entryDate("2026-08", "2026-09-20"), "2026-08-01");
+  assert.equal(entryDate("2026-09", "2026-09-20"), "2026-09-20");
+  assert.equal(entryDate("2027-01", "2026-12-31"), "2027-01-01");
+});

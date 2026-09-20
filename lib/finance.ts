@@ -113,3 +113,13 @@ export function demoRows(month: string): Transaction[] {
     notes: "",
   }));
 }
+
+export function transactionsForMonth(rows: Transaction[], month: string) {
+  return rows
+    .filter((row) => row.date.startsWith(month + "-"))
+    .sort((a, b) => b.date.localeCompare(a.date));
+}
+
+export function entryDate(month: string, today: string) {
+  return today.startsWith(month + "-") ? today : `${month}-01`;
+}

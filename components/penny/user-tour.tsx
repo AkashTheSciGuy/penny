@@ -69,7 +69,9 @@ export default function UserTour({ request, onNavigate }: Props) {
       seen = localStorage.getItem(TOUR_KEY) === "done";
     } catch {}
     if (seen || new URLSearchParams(location.search).has("reset")) return;
-    const timer = window.setTimeout(() => setStep(0), 650);
+    const timer = window.setTimeout(() => {
+      if (!document.querySelector("dialog[open]")) setStep(0);
+    }, 650);
     return () => window.clearTimeout(timer);
   }, []);
 
@@ -109,6 +111,9 @@ export default function UserTour({ request, onNavigate }: Props) {
     } catch {}
     setStep(null);
     if (completed) onNavigate("Overview");
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: "instant" });
+    });
   }
 
   const active = steps[step ?? 0];

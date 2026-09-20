@@ -19,7 +19,6 @@ import {
   ChevronRight,
   LogOut,
   CircleHelp,
-  SlidersHorizontal,
   CreditCard,
   Target,
 } from "lucide-react";
@@ -36,6 +35,8 @@ import {
   totals,
   csv,
   demoRows,
+  transactionsForMonth,
+  entryDate,
 } from "@/lib/finance";
 
 const dateToday = () => {
@@ -71,7 +72,10 @@ export default function Home() {
   const [editing, setEditing] = useState<Transaction | null>(null);
   const [busy, setBusy] = useState(false);
   const [authMode, setAuthMode] = useState("signin");
-  const [pendingDelete, setPendingDelete] = useState<{id: string; table: "transactions" | "budgets"} | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{
+    id: string;
+    table: "transactions" | "budgets";
+  } | null>(null);
   const [deleteError, setDeleteError] = useState("");
   const deleteDialog = useRef<HTMLDialogElement>(null);
   const deleteLock = useRef(false);
@@ -80,29 +84,62 @@ export default function Home() {
     else deleteDialog.current?.close();
   }, [pendingDelete]);
   const dialog = useRef<HTMLDialogElement>(null);
+  const saveLock = useRef(false);
+  const ownerId = useRef<string | null>(null);
   const demoInitialized = useRef(false);
   useEffect(() => {
     setMonth(dateToday().slice(0, 7));
-    setCurrency(localStorage.getItem("penny-currency") || "USD");
+    try {
+      const saved = localStorage.getItem("penny-currency");
+      if (
+        saved &&
+        ["USD", "INR", "EUR", "GBP", "CAD", "AUD", "JPY"].includes(saved)
+      )
+        setCurrency(saved);
+    } catch {
+      /* Browser storage is optional. */
+    }
     if (!supabase) {
       setReady(true);
       return;
     }
-    supabase.auth.getSession().then(({ data, error }) => {
-      if (error)
-        setError("Unable to restore your session. Please sign in again.");
-      setUser(data.session?.user ?? null);
+    let active = true;
+    let authEventReceived = false;
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!active) return;
+      authEventReceived = true;
+      const nextId = session?.user.id ?? null;
+      const recovering = event === "PASSWORD_RECOVERY" || new URLSearchParams(location.search).has("reset");
+      if (ownerId.current !== nextId) {
+        ownerId.current = nextId;
+        setRows([]);
+        setBudgets([]);
+        if (!recovering) setModal(null);
+        setPendingDelete(null);
+      }
+      setUser(previous => previous?.id === nextId ? previous : (session?.user ?? null));
+      if (session) setDemo(false);
+      if (recovering && session) { setAuthMode("update"); setModal("auth"); }
       setReady(true);
     });
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      setRows([]);
-      setBudgets([]);
+    supabase.auth.getSession().then(({ data, error }) => {
+      // A later auth event is authoritative; a stale startup read must not replace it.
+      if (!active || authEventReceived) return;
+      if (error) setError("Unable to restore your session. Please sign in again.");
+      ownerId.current = data.session?.user.id ?? null;
+      setUser(data.session?.user ?? null);
+      if (data.session) setDemo(false);
+      setReady(true);
+    }).catch(() => {
+      if (!active || authEventReceived) return;
+      setError("Unable to restore your session. Please sign in again.");
+      setReady(true);
     });
-    return () => data.subscription.unsubscribe();
+    return () => { active = false; data.subscription.unsubscribe(); };
   }, []);
   useEffect(() => {
     if (demo) {
+      setLoading(false);
       if (demoInitialized.current) return;
       demoInitialized.current = true;
       setRows(demoRows(dateToday().slice(0, 7)));
@@ -129,9 +166,13 @@ export default function Home() {
       return;
     }
     demoInitialized.current = false;
-    if (!user || !supabase) return;
+    if (!user || !supabase) {
+      setLoading(false);
+      return;
+    }
     let active = true;
     setLoading(true);
+    setError("");
     (async () => {
       try {
         const all: Transaction[] = [];
@@ -144,6 +185,7 @@ export default function Home() {
             .range(offset, offset + 999);
           if (error) throw error;
           all.push(...data);
+          if (!active) return;
           if (data.length < 1000) break;
         }
         const { data, error } = await supabase!
@@ -205,6 +247,8 @@ export default function Home() {
                 Object.keys(input).length
               )
                 throw new Error("Expected an empty object");
+              if ((!demo && !user) || busy || loading) throw new Error("Sign in and wait for loading to finish before adding a transaction.");
+              if (document.querySelector("dialog[open]")) throw new Error("Close the current dialog first.");
               setEditing(null);
               setModal("transaction");
               return { status: "form_opened" };
@@ -215,10 +259,11 @@ export default function Home() {
       ).catch(() => {});
     } catch {}
     return () => abort.abort();
-  }, []);
-  const selected = rows.filter((x) => x.date.startsWith(month));
+  }, [demo, user, busy, loading]);
+  const selected = transactionsForMonth(rows, month);
   const sum = totals(selected);
   const fmt = (v: number) => money(v, currency);
+  const recent = selected;
   const filtered = selected
     .filter(
       (x) =>
@@ -246,17 +291,22 @@ export default function Home() {
   }
   function exportRows() {
     const url = URL.createObjectURL(
-      new Blob(["\uFEFF" + csv(filtered)], { type: "text/csv;charset=utf-8;" }),
+      new Blob(["\uFEFF" + csv(view === "Transactions" ? filtered : recent)], {
+        type: "text/csv;charset=utf-8;",
+      }),
     );
     const link = document.createElement("a");
     link.href = url;
     link.download = `penny-${month}-${currency}.csv`;
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(url);
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   async function save(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (busy) return;
+    if (saveLock.current || loading) return;
+    saveLock.current = true;
     setBusy(true);
     setError("");
     const f = new FormData(e.currentTarget);
@@ -300,6 +350,10 @@ export default function Home() {
           item = result.data;
         }
         setRows((old) => [item, ...old.filter((x) => x.id !== item.id)]);
+        setMonth(item.date.slice(0, 7));
+        setQuery("");
+        setType("all");
+        setCategory("all");
       } else {
         let budget: Budget = {
           id: crypto.randomUUID(),
@@ -335,6 +389,7 @@ export default function Home() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to save.");
     } finally {
+      saveLock.current = false;
       setBusy(false);
     }
   }
@@ -350,11 +405,12 @@ export default function Home() {
     const { id, table } = pendingDelete;
     try {
       if (!demo) {
-        const { error } = await supabase!.from(table).delete().eq("id", id);
-        if (error) throw error;
+        const { data, error } = await supabase!.from(table).delete().eq("id", id).select("id");
+        if (error || !data?.length) throw error ?? new Error("Record was not deleted");
       }
-      if (table === "transactions") setRows(old => old.filter(x => x.id !== id));
-      else setBudgets(old => old.filter(x => x.id !== id));
+      if (table === "transactions")
+        setRows((old) => old.filter((x) => x.id !== id));
+      else setBudgets((old) => old.filter((x) => x.id !== id));
       setPendingDelete(null);
       setNotice("Deleted.");
     } catch {
@@ -366,7 +422,8 @@ export default function Home() {
   }
   async function authenticate(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!supabase) return;
+    if (!supabase || saveLock.current) return;
+    saveLock.current = true;
     setBusy(true);
     setError("");
     const f = new FormData(e.currentTarget);
@@ -384,18 +441,21 @@ export default function Home() {
               ? await supabase.auth.updateUser({ password })
               : await supabase.auth.signInWithPassword({ email, password });
       if (error) throw error;
-      setDemo(false);
+      if (authMode !== "reset") setDemo(false);
+      if (authMode === "update")
+        history.replaceState(null, "", location.pathname);
       setModal(null);
       setNotice(
         authMode === "signup"
           ? "Check your email to confirm your account."
           : authMode === "reset"
             ? "If your account exists, a reset email is on its way."
-            : "Account updated.",
+            : authMode === "signin" ? "Signed in successfully." : "Password updated.",
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Authentication failed.");
     } finally {
+      saveLock.current = false;
       setBusy(false);
     }
   }
@@ -427,7 +487,7 @@ export default function Home() {
                       <button
                         aria-label={`Delete ${b.category} budget`}
                         className="icon-button"
-                        disabled={busy}
+                        disabled={busy || loading}
                         onClick={() => remove(b.id, "budgets")}
                       >
                         <Trash2 size={15} />
@@ -464,7 +524,7 @@ export default function Home() {
     );
   }
   function renderTransactions({ short = false }: { short?: boolean }) {
-    const shown = short ? filtered.slice(0, 5) : filtered;
+    const shown = short ? recent.slice(0, 5) : filtered;
     return (
       <div className="table-wrap">
         <table>
@@ -525,6 +585,7 @@ export default function Home() {
                   <div className="actions">
                     <button
                       className="icon-button"
+                      disabled={busy || loading}
                       aria-label={`Edit ${x.title}`}
                       onClick={() => {
                         setEditing(x);
@@ -535,7 +596,7 @@ export default function Home() {
                     </button>
                     <button
                       className="icon-button"
-                      disabled={busy}
+                      disabled={busy || loading}
                       aria-label={`Delete ${x.title}`}
                       onClick={() => remove(x.id, "transactions")}
                     >
@@ -591,7 +652,9 @@ export default function Home() {
         <button className="brand" onClick={() => setView("Overview")}>
           <span>p</span>penny<span className="brand-dot">.</span>
         </button>
-        <div className="sidebar-theme"><ThemeToggle /></div>
+        <div className="sidebar-theme">
+          <ThemeToggle />
+        </div>
         <div className="workspace">
           <span className="avatar">P</span>
           <div>
@@ -607,12 +670,25 @@ export default function Home() {
         <nav>
           {navigation.map((n) => (
             <button
+              aria-label={n.name}
+              aria-current={view === n.name ? "page" : undefined}
               className={view === n.name ? "active" : ""}
               onClick={() => setView(n.name)}
               key={n.name}
             >
               <n.icon size={20} />
-              {n.name}
+              <span
+                className="nav-text"
+                data-compact={
+                  n.name === "Transactions"
+                    ? "Activity"
+                    : n.name === "Overview"
+                      ? "Home"
+                      : n.name
+                }
+              >
+                {n.name}
+              </span>
               {view === n.name && <span className="nav-mark" />}
             </button>
           ))}
@@ -706,7 +782,7 @@ export default function Home() {
             <button
               className="primary"
               onClick={openAdd}
-              disabled={!demo && !user}
+              disabled={loading || busy || (!demo && !user)}
             >
               <Plus size={18} />
               Add transaction
@@ -735,11 +811,23 @@ export default function Home() {
                 <input
                   id="month"
                   type="month"
+                  min="1900-01"
+                  max="9999-12"
+                  disabled={busy}
                   value={month}
-                  onChange={(e) => e.target.value && setMonth(e.target.value)}
+                  onChange={(e) => { if (/^[0-9]{4}-(0[1-9]|1[0-2])$/.test(e.target.value)) setMonth(e.target.value); }}
+                  onInput={(e) => {
+                    const value = e.currentTarget.value;
+                    if (/^[0-9]{4}-(0[1-9]|1[0-2])$/.test(value))
+                      setMonth(value);
+                  }}
                 />
               </div>
-              <button className="secondary" onClick={exportRows}>
+              <button
+                className="secondary"
+                disabled={loading || !selected.length}
+                onClick={exportRows}
+              >
                 <Download size={16} />
                 Export CSV
               </button>
@@ -883,7 +971,7 @@ export default function Home() {
                     </div>
                     <div className="category-legend">
                       {spending.length ? (
-                        spending.slice(0, 4).map((x) => (
+                        spending.map((x) => (
                           <div key={x.name}>
                             <span>
                               <i style={{ background: x.color }} />
@@ -930,8 +1018,11 @@ export default function Home() {
                   <button
                     className="icon-button"
                     aria-label="Add budget"
-                    disabled={!demo && !user}
-                    onClick={() => setModal("budget")}
+                    disabled={loading || busy || (!demo && !user)}
+                    onClick={() => {
+                      setEditing(null);
+                      setModal("budget");
+                    }}
                   >
                     <Plus size={18} />
                   </button>
@@ -977,7 +1068,18 @@ export default function Home() {
                     <option key={c}>{c}</option>
                   ))}
                 </select>
-                <SlidersHorizontal size={18} />
+                {(query || type !== "all" || category !== "all") && (
+                  <button
+                    className="secondary"
+                    onClick={() => {
+                      setQuery("");
+                      setType("all");
+                      setCategory("all");
+                    }}
+                  >
+                    Clear filters
+                  </button>
+                )}
               </div>
               {renderTransactions({})}
               <div className="table-footer">
@@ -992,8 +1094,11 @@ export default function Home() {
                 <h3>Your monthly plan</h3>
                 <button
                   className="primary"
-                  disabled={!demo && !user}
-                  onClick={() => setModal("budget")}
+                  disabled={loading || busy || (!demo && !user)}
+                  onClick={() => {
+                    setEditing(null);
+                    setModal("budget");
+                  }}
                 >
                   <Plus size={16} />
                   Set budget
@@ -1010,7 +1115,9 @@ export default function Home() {
             <div className="settings-grid">
               <section className="card">
                 <h3>Preferences</h3>
-                <div className="settings-theme"><ThemeToggle /></div>
+                <div className="settings-theme">
+                  <ThemeToggle />
+                </div>
                 <button
                   className="secondary"
                   onClick={() => setTourRequest((value) => value + 1)}
@@ -1024,7 +1131,11 @@ export default function Home() {
                     value={currency}
                     onChange={(e) => {
                       setCurrency(e.target.value);
-                      localStorage.setItem("penny-currency", e.target.value);
+                      try {
+                        localStorage.setItem("penny-currency", e.target.value);
+                      } catch {
+                        /* Keep the preference for this visit. */
+                      }
                     }}
                   >
                     {["USD", "INR", "EUR", "GBP", "CAD", "AUD", "JPY"].map(
@@ -1047,6 +1158,20 @@ export default function Home() {
                     ? "Your Supabase connection is configured. Sign in to save and sync your expenses."
                     : "Supabase is not connected yet. Follow the project README to create your free project, apply the database setup, and add your project URL and publishable key."}
                 </p>
+                {user && (
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={async () => {
+                      const result = await supabase!.auth.signOut();
+                      if (result.error)
+                        setError("Could not sign out. Please try again.");
+                    }}
+                  >
+                    <LogOut size={16} />
+                    Sign out
+                  </button>
+                )}
                 {supabase && (
                   <button
                     className="primary"
@@ -1074,19 +1199,62 @@ export default function Home() {
           </footer>
         </div>
       </main>
-      <dialog ref={deleteDialog} className="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description" onCancel={event => { event.preventDefault(); if (!deleteLock.current) setPendingDelete(null); }}>
-        <div className="delete-symbol"><Trash2 size={25} /></div>
-        <h2 id="delete-title">Delete {pendingDelete?.table === "budgets" ? "budget" : "transaction"}?</h2>
-        <p id="delete-description">This will permanently remove {pendingDelete?.table === "transactions" ? <strong>{rows.find(row => row.id === pendingDelete.id)?.title || "this transaction"}</strong> : "this budget"}. This cannot be undone.</p>
-        {deleteError && <p className="error" role="alert">{deleteError}</p>}
+      <dialog
+        ref={deleteDialog}
+        className="delete-dialog"
+        aria-labelledby="delete-title"
+        aria-describedby="delete-description"
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!deleteLock.current) setPendingDelete(null);
+        }}
+      >
+        <div className="delete-symbol">
+          <Trash2 size={25} />
+        </div>
+        <h2 id="delete-title">
+          Delete {pendingDelete?.table === "budgets" ? "budget" : "transaction"}
+          ?
+        </h2>
+        <p id="delete-description">
+          This will permanently remove{" "}
+          {pendingDelete?.table === "transactions" ? (
+            <strong>
+              {rows.find((row) => row.id === pendingDelete.id)?.title ||
+                "this transaction"}
+            </strong>
+          ) : (
+            "this budget"
+          )}
+          . This cannot be undone.
+        </p>
+        {deleteError && (
+          <p className="error" role="alert">
+            {deleteError}
+          </p>
+        )}
         <div className="delete-actions">
-          <button className="secondary" autoFocus disabled={busy} onClick={() => setPendingDelete(null)}>Cancel</button>
-          <button className="delete-confirm" disabled={busy} onClick={confirmDelete}>{busy ? "Deleting…" : "Delete"}</button>
+          <button
+            className="secondary"
+            autoFocus
+            disabled={busy || loading}
+            onClick={() => setPendingDelete(null)}
+          >
+            Cancel
+          </button>
+          <button
+            className="delete-confirm"
+            disabled={busy || loading}
+            onClick={confirmDelete}
+          >
+            {busy ? "Deleting…" : "Delete"}
+          </button>
         </div>
       </dialog>
       <UserTour request={tourRequest} onNavigate={setView} />
       <dialog
         ref={dialog}
+        aria-labelledby="entry-dialog-title"
         onCancel={(event) => {
           if (busy) event.preventDefault();
           else setModal(null);
@@ -1096,7 +1264,7 @@ export default function Home() {
         }}
       >
         <div className="modal-heading">
-          <h2>
+          <h2 id="entry-dialog-title">
             {modal === "auth"
               ? authMode === "signup"
                 ? "Create an account"
@@ -1113,7 +1281,7 @@ export default function Home() {
           </h2>
           <button
             className="icon-button"
-            disabled={busy}
+            disabled={busy || loading}
             aria-label="Close dialog"
             onClick={() => setModal(null)}
           >
@@ -1121,7 +1289,7 @@ export default function Home() {
           </button>
         </div>
         {modal === "auth" ? (
-          <form onSubmit={authenticate}>
+          <form onSubmit={authenticate} key={authMode}>
             {authMode !== "update" && (
               <label className="field">
                 Email
@@ -1147,7 +1315,7 @@ export default function Home() {
                 />
               </label>
             )}
-            <button className="primary full" disabled={busy}>
+            <button className="primary full" disabled={busy || loading}>
               {busy
                 ? "Please wait…"
                 : authMode === "signup"
@@ -1161,15 +1329,24 @@ export default function Home() {
             <div className="auth-links">
               <button
                 type="button"
-                onClick={() =>
-                  setAuthMode(authMode === "signup" ? "signin" : "signup")
-                }
+                disabled={busy}
+                onClick={() => {
+                  setError("");
+                  setAuthMode(authMode === "signin" ? "signup" : "signin");
+                }}
               >
-                {authMode === "signup"
-                  ? "Already have an account? Sign in"
-                  : "Create an account"}
+                {authMode === "signin"
+                  ? "Create an account"
+                  : "Back to sign in"}
               </button>
-              <button type="button" onClick={() => setAuthMode("reset")}>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setError("");
+                  setAuthMode("reset");
+                }}
+              >
                 Forgot password?
               </button>
             </div>
@@ -1206,7 +1383,11 @@ export default function Home() {
                       name="date"
                       type="date"
                       required
-                      defaultValue={editing?.date || dateToday()}
+                      min="1900-01-01"
+                      max="9999-12-31"
+                      defaultValue={
+                        editing?.date || entryDate(month, dateToday())
+                      }
                     />
                   </label>
                 </div>
@@ -1285,5 +1466,4 @@ export default function Home() {
     </div>
   );
 }
-
 
